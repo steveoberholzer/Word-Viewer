@@ -14,6 +14,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     // ── State ────────────────────────────────────────────────────────────────
 
     private string? _currentFilePath;
+    private string? _tempHtmlFile;
     private double  _zoom = 1.0;
     private bool    _documentLoaded;
     private bool    _loading;
@@ -34,13 +35,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         await WebView.EnsureCoreWebView2Async();
 
-        // Accept drag-drop at the WebView2 host level too
         WebView.AllowDrop = true;
+
+        // Hook NavigationCompleted so we can apply zoom reliably after each load
+        WebView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
 
         // Open a file passed via command-line argument
         var args = Environment.GetCommandLineArgs();
         if (args.Length > 1 && File.Exists(args[1]))
             await OpenFileAsync(args[1]);
+    }
+
+    private async void OnNavigationCompleted(object? sender,
+        Microsoft.Web.WebView2.Core.CoreWebView2NavigationCompletedEventArgs e)
+    {
+        if (_documentLoaded)
+            await ApplyZoomAsync(_zoom);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        DeleteTempFile();
     }
 
     // ── Commands ─────────────────────────────────────────────────────────────
@@ -121,7 +137,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         Title            = "Word Viewer";
         StatusText       = "Ready";
         WarningText      = string.Empty;
-        WebView.NavigateToString(string.Empty);
+        WebView.CoreWebView2.Navigate("about:blank");
+        DeleteTempFile();
         OnPropertyChanged(nameof(WelcomeVisibility));
         OnPropertyChanged(nameof(DocumentVisibility));
         CommandManager.InvalidateRequerySuggested();
@@ -138,11 +155,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var (html, warnings) = await Task.Run(() => ConvertDocument(_currentFilePath!));
 
             var page = BuildHtmlPage(html);
-            WebView.NavigateToString(page);
-
-            // Apply current zoom after a short delay for the page to settle
-            await Task.Delay(50);
-            await ApplyZoomAsync(_zoom);
+            await NavigateToHtmlAsync(page);
 
             _documentLoaded = true;
             StatusText  = Path.GetFileName(_currentFilePath)!;
@@ -176,6 +189,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ? $"{result.Warnings.Count} conversion warning(s)"
             : string.Empty;
         return (result.Value, warnings);
+    }
+
+    // ── Navigation helpers ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// NavigateToString has a ~2 MB limit (fails on large documents with embedded images).
+    /// Writing to a temp file and using Navigate() has no such limit.
+    /// </summary>
+    private async Task NavigateToHtmlAsync(string html)
+    {
+        // Reuse a single temp file for the lifetime of the app
+        _tempHtmlFile ??= Path.Combine(Path.GetTempPath(), $"WordViewer_{Environment.ProcessId}.html");
+        await File.WriteAllTextAsync(_tempHtmlFile, html, System.Text.Encoding.UTF8);
+        WebView.CoreWebView2.Navigate("file:///" + _tempHtmlFile.Replace('\\', '/'));
+    }
+
+    private void DeleteTempFile()
+    {
+        if (_tempHtmlFile == null) return;
+        try { File.Delete(_tempHtmlFile); } catch { }
+        _tempHtmlFile = null;
     }
 
     // ── HTML page builder ─────────────────────────────────────────────────────
